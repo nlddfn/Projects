@@ -1,5 +1,5 @@
 # Projects
-In this folder I listed a few (mini)projects I have been working on:
+In this folder I listed the projects I have been recently working on:
 
 1. [Better Life Index across OECD countries](http://blog.nycdatascience.com/student-works/r-visualization/oecd-betterlifeindex/): a critical perspective: Can we measure the well-being of a society? How does that compare to our personal perception? While a better understanding of people’s well-being is important to developing better policies, merging measured data and the individual experience in one coherent picture, remains challenging. In this project, we will try to describe this problem, by exploring the so called Better Life Index.
 
