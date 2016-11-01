@@ -1,0 +1,385 @@
+---
+title: "Trivago Challenge"
+author: "Diego De Lazzari"
+date: "13/10/2016"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo=FALSE, include=FALSE}
+# Data Manipulation and visualization
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(car)
+library(corrplot)
+# Missingness and imputation
+library(Hmisc)
+library(VIM)
+library(mice)
+# Modeling
+library(caret)
+library(xgboost)
+
+# Load functions and data dir
+set.seed(0)
+setwd("~/Documents/Git_stuff/Projects/BIdatachallenge")
+source("~/Documents/R code/R_fun_collection.R")
+
+##### FUNCTIONS #####
+impute_star <- function(obs,df){
+  tmp = filter(df, df$city_id == obs) %>% 
+        group_by(., stars) %>%
+        summarise(.,count = n()) %>% 
+        filter(., count == max(count))
+  if(length(tmp$stars == 1) && is.na(tmp$stars)) return(0)
+  if(length(tmp$stars)>1) return(max(tmp$stars))
+  else return(tmp$stars)             
+}
+####### The wMSE function defined according to Trivago
+
+wMSE = function(real,pred){
+  # weight
+  w = log(real + 1) + 1
+  error = t(as.matrix(w)) %*% as.matrix((pred - real)^2)/ sum(w)
+  return(error)}
+
+wMSE_summary <- function(data, lev = NULL, model = NULL){
+  out = (wMSE(data$obs, data$pred))
+  names(out) <- "wMSE"
+  return(out)
+}
+evalerror <- function(preds, dtrain) {
+  labels <- getinfo(dtrain, "label")
+  err <- wMSE(labels, preds)
+  return(list(metric = "error", value = err))
+}
+```
+
+## Outline
+
+0. Introduction
+1. Basic EDA
+2. Outliers
+3. Training the model
+4. Analisys of missingness and final model
+5. Conclusions
+
+## Introduction
+This report focuses on predicting the number of clicks for a given hotel, as a function of location, average price, competitivity (offering a cheaper rate for the same hotel with respect to competitors) and ranking on Trivago's website. 
+
+The input dataset contains information for 833085 hotels, described by 10 features. About 1/3 of the data does not contain information on the number of clicks and will be used for the final prediction. In the first step I will address the outliers, or more precisely the noise and wrong values appearing in the dataset. Next, I will be discussing in detail the assumptions and the imputation methods for missing data (~30% of the total).
+Once the pre-processing is complete, I will train a simple model on the non-imputed data and use the model to obtain a first order prediction of the click number. This estimate will be used as extra feature on the dataset after imputation.
+
+```{r I/O, echo=FALSE}
+
+#load dataset with size [832085, 10]
+df <- read.csv("data_recruiting_bi_data_challenge.csv", header=T, row.names = 1) 
+colnames(df) = c('hotel_id',  'city_id', 'clicks', 'stars', 'distance',
+                 'avg_price', 'rating','num_part', 'rel_saving', 'avg_rank')
+
+# Show basic EDA
+open_sesame(select(df,-3))
+
+# Drop negative values
+df[df == -1] <- NA
+
+# set subsample data for visualization: 1% of the complete cases. Drop hotel_id, 
+# city_id and clicks.
+good.cases = complete.cases(df)
+df.good.cases = df[good.cases,c(4:10)]
+df.subsample <- df.good.cases[sample(1:nrow(df.good.cases), 
+                                     nrow(df.good.cases)/100, replace=FALSE),]
+```
+
+## Basic EDA
+In first place, let's explore the full dataset, including training and target. The summary table reported above shows a number of nonsensical values: 
+
+- Features "stars" and "distance to center" show a minimum at -1. This is probably an error and will be treated as missing value. 
+- The distance from the nearest city center ranges from 1 meter (after removing negative values) to ~18650 km! Without knowing the actual location, it is hard to correct for such errors.
+- The average price per night shows values as low as 6, or as high as 9995. This can be justified by the location of the hotel (different nationality), the currency exchange or simple mistake. 
+- Surprisingly, the average price does not seem to be necessarily correlated with the number of stars. The most expensive hotel is classified as 0 stars while the most expensive 5 stars hotel is about twice as cheap. 
+- The number of partners showing rates for an hotel and the average saving are more difficult to interpret and show a large variability (0.07 to 5.28 for nbr_partners_index and 0 to 90 for avg_rel_saving). It is unclear whether these ranges may or may not be meaningful.
+- The histogram and pair-wise plots for the features clearly show the precence of outliers. 
+- While average price, number of stars and rating are intuitively correlated, the correlation plot on the raw data features does not show multicollinearity.
+
+```{r EDA, echo = FALSE, warning=FALSE}
+# show scatterplot and correlation plot
+scatterplotMatrix(df.subsample[ ,c(1,2,3,4)],
+                  diagonal='histogram',
+                  ellipse=FALSE)
+```
+
+```{r EDA2, echo = FALSE, warning=FALSE}
+scatterplotMatrix(df.subsample[ ,c(5,6,7)],
+                diagonal='histogram',
+                ellipse=FALSE)
+```
+
+```{r EDA3, echo = FALSE, warning=FALSE}
+
+corrplot(cor(df.good.cases), order = "hclust")
+```
+
+### Outliers for distance to center
+- In the box plots below, we observe the distance to center distribution versus number stars. The first plot is clearly dominated by the presence of outliers, appearing both in training and target datasets (blue and pink dots, respectively). For classes 2 to 5, the outliers are somewhat clustered around 12000 Km, suggesting that the distance was measured with respect to the wrong city (i.e. Cambridge, MA versus Cambridge, UK). 
+- About 95% of the hotels are located within ~ 17 Km from the center. Distances beyond this threshold are therefore dropped and imputed in the next step. Notice that these observations exist both in the training and in target dataset. The second plot refers to the same distribution, after applying the filter. 
+
+![Boxplot for distance from closest city versus stars.](boxplot_distance.png)
+
+
+![Boxplot for distance from closest city versus stars, Max = 17km.](boxplot_distance_cut.png)
+
+```{r Outliers distribution, eval = FALSE, echo=FALSE}
+# Boxplot before filter
+Label <-factor(is.na(df$clicks),levels = c(TRUE,FALSE), labels =  c('Target','Training'))
+g = ggplot(df,aes(stars,distance)) + 
+    geom_boxplot(aes(group = cut_width(stars, 1)),outlier.colour = "black", outlier.shape = 3) +
+    geom_jitter(aes_string(colour = Label), width = 0.2) + 
+    theme(legend.position="top", legend.direction="horizontal") +
+    scale_fill_discrete("")
+
+ggsave("boxplot_distance.png",plot=g)
+```
+
+```{r Impute stars and remove distance outliers, warning=FALSE,message=FALSE,echo=FALSE}
+
+# Imputing stars using only City.id: 
+# 1 - For each missing value filter rows with the same city.id
+# 2 - Take majority vote
+
+good = complete.cases(df$stars)
+df[!good,4] = lapply(df[!good,2],function(x) impute_star(x,df[,c(2,4)]))
+
+# Remove wrong values on distance from center
+df[,"distance"] = transmute(df, distance =  ifelse(distance>17000,NA,distance))
+print(paste0('The missing rate for distance is ',
+             round(length(df$distance[is.na(df$distance)])/nrow(df)*100,1),'%'))
+```
+
+```{r Distance distribution, eval = FALSE, echo=FALSE}
+# Boxplot after filter
+Label <-factor(is.na(df$clicks),levels = c(TRUE,FALSE), labels =  c('Target','Training'))
+g = ggplot(df,aes(stars,distance))  + geom_boxplot(aes(group = cut_width(stars, 1)),
+    outlier.colour = "black", outlier.shape = 3) +
+    geom_jitter(aes_string(colour = Label), width = 0.2) + 
+    theme(legend.position="top", legend.direction="horizontal") +
+    scale_fill_discrete("")
+
+ggsave("boxplot_distance_cut.png",plot=g)
+```
+
+## Training the model
+
+Given the large sparsity of the data (30% NA prior imputation) it may be interesting to start from a simple model, using only non imputed sparse data and gradient boosted trees. Notice that the feature city_id shows over 54000 unique values. Should we treat the numeric values as factors and dummify the feature, the size of the dataset would grow enormously. To account for hotel location, we can use the frequency with which a given city_id occurs in the dataset. The higher the frequency the larger the number of hotels in a given city, allowing therefore a comparison between different locations.
+
+Data is partitioned in train and test (80%-20%) while the model is based on extreme gradient boosting (XGBoost). Parameters were tuned with standard, 5-fold cross-validation. The lowest weighted mean square error (wMSE) was obtained for:
+
+- eta = 0.05, gamma = .1, max_depth = 8, subsample = .75, colsample_bytree = .8.
+
+The result of the model is reported below. As shown in the feature importance plot, feature 7 and 6 (location frequency and average ranking on the website) are accounting for 60% of the gain. Using the wMSE as error metrics, we obtain an average discrepancy between observed and predicted clicks of 17.
+
+```{r Modeling, echo=FALSE}
+# Calculate frequency table for city_id. Add as extra feat,remove categoricals 
+df_hotel_id = df['hotel_id']
+freq_tabl = table(df$city_id)
+df = df%>% mutate(.,city_freq=freq_tabl[as.character(city_id)]) %>% select(.,-hotel_id,-city_id)
+
+# Split training and target dataset.
+df_target     <- filter(df,is.na(df$clicks))
+df_train_all  <- filter(df,is.na(df$clicks)== FALSE)
+
+# Partition train in train_cv and test using Data Partion in R caret
+# (stratification is unnecessary because the label is an integer)
+
+train.index <- createDataPartition(df_train_all$clicks, p = .8, list = FALSE)
+df_train    <- df_train_all[ train.index,]
+df_test     <- df_train_all[-train.index,]
+
+# create sparse matrices for XGB. 
+df_train_sparse  <- xgb.DMatrix(data = data.matrix(df_train[,-1]) , label = df_train$clicks,  missing = NA) 
+df_test_sparse   <- xgb.DMatrix(data = data.matrix(df_test[,-1])  , label = df_test$clicks,   missing = NA)
+df_target_sparse <- xgb.DMatrix(data = data.matrix(df_target[,-1]), label = df_target$clicks, missing = NA)
+```
+
+```{r Tuning, echo=FALSE, eval=FALSE}
+# Tune the model:
+
+# fixed parameters
+ntrees <- 100
+param <- list(
+            eta = .05,
+            silent = 1,
+            nthread = 16,
+            gamma = .1,
+            verbose = 2,
+            objective = "reg:linear",
+            eval_metric=evalerror )
+
+# Grid search
+searchGridSubCol <- expand.grid(subsample = c(0.5,0.75,1.0),
+                                colsample_bytree = c(0.4,0.6,0.8),
+                                max_depth = c(4,6,8))
+
+rmseErrorsHyperparameters <- apply(searchGridSubCol, 1, function(parameterList){
+  
+  #Extract Parameters to test
+  currentSubsampleRate <- parameterList[["subsample"]]
+  currentColsampleRate <- parameterList[["colsample_bytree"]]
+  currentMax_depth     <- parameterList[["max_depth"]]
+  
+  xgboostModelCV <- xgb.cv(params = param, data =  df_train_sparse, nrounds = ntrees, nfold = 5, showsd = TRUE,
+                           verbose = TRUE, "max.depth" = currentMax_depth,                               
+                           "subsample" = currentSubsampleRate, "colsample_bytree" = currentColsampleRate)
+  
+  xvalidationScores <- as.data.frame(xgboostModelCV)
+  #Save rmse of the last iteration
+  wrmse <- tail(xvalidationScores$test.error.mean, 1)
+  
+  return(c(wrmse, currentSubsampleRate, currentColsampleRate, currentMax_depth))
+  })
+
+# Pick best parameters
+print(rmseErrorsHyperparameters)
+minErr = which.min(rmseErrorsHyperparameters[1,])
+bestParam = rmseErrorsHyperparameters[,minErr]
+param$subsample = bestParam[2]
+param$colsample_bytree = bestParam[3]
+param$max_depth = bestParam[4]
+
+watchlist <- list(train = df_train_sparse, test=df_test_sparse)
+
+xgb.model <- xgb.train(params = param, data=df_train_sparse, nround=200, nfold = 5, stratified = TRUE, watchlist = watchlist)
+
+# save model and tuning
+xgb.save(xgb.model, "data/xgb.model")
+save(rmseErrorsHyperparameters,file='data/tuning.Rdata')
+save(param,file='data/xgb_param.Rdata')
+
+# Calculate the predictions for the full dataset (Target and Train). Use the 
+# prediction as new feature for the imputed dataset.
+df.xgb  = xgb.DMatrix(data = data.matrix(df[,-1]) , label = df$clicks,  missing = NA) 
+XGBpred = round(predict(xgb.model, df.xgb, missing=NA))
+save(XGBpred,file = 'data/xgbPred_nonImputed.Rdata')
+```
+
+```{r Model output, echo=FALSE}
+if(exists("xgb.model") == F){
+  xgb.model = xgb.load("data/xgb.model")}
+
+# Features Importance plot
+importance_matrix <- xgb.importance(model = xgb.model)
+head(importance_matrix)
+xgb.plot.importance(importance_matrix = importance_matrix)
+
+# Predicted clicks VS Obs clicks
+pred = round(predict(xgb.model, df_test_sparse, missing=NA))
+pred[pred<0]=0
+obs  = df_test$clicks
+avgClickErr = round(mean(abs(pred - obs)),0)
+check_test = data.frame(pred=pred,obs=obs)
+
+# Output
+print('---RESULTS: XGBOOST on non imputed data:---')
+print(paste0('Test wMSE = ', round(wMSE(obs,pred),0) ))
+print(paste0('The average discrepancy between observed and predicted number of clicks is ',avgClickErr))
+```
+## Analisys of missingness and final model 
+As mentioned in the introduction, only the first 2 features, 'hotel_id' and 'city_id', appear to be complete, whereas 77% of the data is missing for avg_price and between 40% to 60% is missing for 'rating', 'number of partners', 'relative saving' and 'avg_rank'. These 5 features are often missing toghether (39% of the cases) and the corresponding value for the number of clicks is 0 (~67%) or NA(~33%). The intuitive explanation for this MNAR missingness is quite simple, i.e the hotels are likely not to appear at all on the website. The features 'stars' and 'distance_from_center' contain about 0.01% and 3% NAs respectively, accounting for dropping negative values. 
+
+```{r missingness, echo=FALSE}
+missingness = aggr(select(df,-1,-9)) # graphical view for missing data
+# summary(aggr(select(df,-1,-9)))
+plot(missingness)
+```
+
+The imputation for multiple features is performed by means of MICE predictive mean matching (PMM). The method is designed to do multiple imputation for missing data, especially for imputing quantitative variables that are not normally distributed. Unlike many methods of imputation, PMM uses linear regression to construct a metric for matching cases with missing data to similar cases with data present. The final dataset contains the imputed original data, the feature for location frequency and the prediction obtained from the first model. 
+
+In analogy with the first model, XGBoost is applied to the new training dataset, using the same parameters. As expected, the first prediction is accounting for 65% of the gain while the location frequency and the average rank account for ~10% each. On the test data wMSE = 11562, corresponding to an average discrepancy between observed and predicted number of clicks of 0.4%.
+
+```{r multiple imputation, eval=FALSE, echo=FALSE}
+# Multiple imputations with MICE -> PMM
+meth = as.vector(c('','fastpmm','fastpmm','fastpmm','fastpmm','fastpmm','fastpmm'))
+imputed_df = mice(df[,2:8],m=1, maxit=1, method = meth)
+
+# Save the object for future evaluation
+saveRDS(imputed_df, file = 'data/imputed_df.rds')
+```
+
+```{r Modeling Imputed, echo=FALSE}
+
+# Load the imputed dataset, if necessary
+if(exists("imputed_df") == F){
+  imputed_df = readRDS(file='data/imputed_df.rds')}
+
+# Load the previous prediction, if necessary
+if(exists("XGBpred") == F){
+  load('data/xgbPred_nonImputed.Rdata')}
+
+# merge imputed_df with city_id frequency table and xgb predictions from non imputed data
+df_im <- bind_cols(df['clicks'], complete(imputed_df,1), df['city_freq'], 
+                   data.frame(XGB=XGBpred))
+
+# Split imputed training and test dataset. Target is the same
+df_im_target      <- filter(df_im,is.na(df$clicks))
+df_im_train_all   <- filter(df_im,is.na(df$clicks)== FALSE)
+
+# Partition train in train_cv and test using Data Partion in R caret
+# (stratification is unnecessary because the label is an integer)
+
+train_im.index <- createDataPartition(df_im_train_all$clicks, p = .8, list = FALSE)
+df_im_train    <- df_im_train_all[ train_im.index,]
+df_im_test     <- df_im_train_all[-train_im.index,]
+
+# create sparse matrices for XGB. 
+df_im_train.xgb  <- xgb.DMatrix(data = data.matrix(df_im_train[,-1]) , label = df_im_train$clicks,  missing = NA) 
+df_im_test.xgb   <- xgb.DMatrix(data = data.matrix(df_im_test[,-1])  , label = df_im_test$clicks,   missing = NA)
+df_im_target.xgb <- xgb.DMatrix(data = data.matrix(df_im_target[,-1]), label = df_im_target$clicks, missing = NA)
+
+watchlist <- list(train = df_im_train.xgb, test=df_im_test.xgb)
+```
+
+```{r XGB Imputed, echo=FALSE, eval=FALSE}
+if(exists("param") == F){
+  load("data/xgb_param.Rdata")}
+
+# Run the model
+xgb.model_im <- xgb.train(params = param, data=df_im_train.xgb, nround=200, stratified = TRUE, watchlist = watchlist)
+# save model
+xgb.save(xgb.model_im, "data/xgb.model_im")
+```
+
+```{r Imputed model output, echo=FALSE}
+if(exists("xgb.model_im") == F){
+  xgb.model_im = xgb.load("data/xgb.model_im")}
+
+# Importance plot
+importance_matrix <- xgb.importance(model = xgb.model_im)
+head(importance_matrix)
+xgb.plot.importance(importance_matrix = importance_matrix)
+
+# Predicted clicks VS Obs clicks
+pred = round(predict(xgb.model_im, df_im_test.xgb, missing=NA))
+pred[pred<0]=0
+obs  = df_im_test$clicks
+avgClickErr_im = round(mean(pred - obs),2)
+check_test_im = data.frame(pred=pred,obs=obs)
+
+# Output
+print('---RESULTS: XGBOOST on imputed data:---')
+print(paste0('Test wMSE = ', round(wMSE(obs,pred),0) ))
+print(paste0('The average discrepancy between observed and predicted number of clicks is ', avgClickErr_im))
+```
+
+```{r Final prediction, echo=FALSE, eval=FALSE}
+# Target prediction
+pred_target = round(predict(xgb.model_im, df_im_target.xgb, missing=NA))
+pred_target[pred_target<0] = 0
+output = data.frame(hotel_id = filter(df_hotel_id,is.na(df$clicks)), 
+                    predicted_number_of_clicks = pred_target)
+write.csv(output,file='data/Trivago_output.csv')
+```
+## Conclusion
+The large amount of noise and missing values observed in the input dataset may limit the quality of any model, nonetheless the combination of feature engineering, gradient boosted trees and imputation allowed to achieve a reasonable prediction of the click rate.
