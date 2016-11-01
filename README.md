@@ -9,7 +9,10 @@ In this folder I listed the projects I have been recently working on:
 
 4. [Predicting Higgs Boson Signal](http://blog.nycdatascience.com/student-works/predicting-higgs-boson-signal/): The Higgs boson was the last hold-out particle remaining hidden during the quest to check the accuracy of the Standard Model of Physics. After decades of search, on March 14, 2013 CERN officially announced the confirmation of the Higgs boson. This Kaggle competition is about building a machine learning algorithm to filter out signal from background noise using selected & simulated ATLAS experiment data.
 
+-------
 
+6. Trivago BI challenge: This mini project focuses on predicting the number of clicks expected for a given hotel, as a function of location, average price, competitivity (offering a cheaper rate for the same hotel with respect to competitors) and ranking on Trivago's website.
 
+7. Bonobos challenge: For a retail company, the goal is to maximize the relevance of each interaction a customer has with the brand. We can use data to contribute to this effort by generating personalized content for customers, for example in the form of outfit recommendations.
 
 
